@@ -1,0 +1,199 @@
+---
+- name: WordPress + nginx en VM spot
+  hosts: wordpress
+  become: true
+  vars:
+    data_dev: /dev/disk/by-id/google-data
+    data_mount: /data
+    wp_root: /var/www/wordpress
+    wp_db: wordpress
+    wp_db_user: wordpress
+    wp_db_pass: "{{ lookup('password', '.wp-secrets/db_pass length=24 chars=ascii_letters,digits') }}"
+    php_ver: "8.3"
+    acme_webroot: /var/www/letsencrypt
+    letsencrypt_email: ""   # opcional; vacío = registro sin email
+    cert_dir: "/etc/letsencrypt/live/{{ wp_domain }}"
+
+  tasks:
+    # ---------- Disco de datos ----------
+    - name: Esperar a que el disco de datos esté presente
+      ansible.builtin.wait_for:
+        path: "{{ data_dev }}"
+        timeout: 120
+
+    - name: Formatear disco de datos (solo si no tiene FS)
+      community.general.filesystem:
+        fstype: ext4
+        dev: "{{ data_dev }}"
+
+    - name: Montar /data
+      ansible.posix.mount:
+        path: "{{ data_mount }}"
+        src: "{{ data_dev }}"
+        fstype: ext4
+        opts: defaults,nofail,discard
+        state: mounted
+
+    - name: Directorios en /data
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+      loop: ["{{ data_mount }}/mysql", "{{ data_mount }}/www", /var/lib/mysql, /var/www]
+
+    - name: Bind mounts /var/lib/mysql y /var/www → /data
+      ansible.posix.mount:
+        path: "{{ item.dst }}"
+        src: "{{ item.src }}"
+        fstype: none
+        opts: bind,nofail,x-systemd.requires-mounts-for={{ data_mount }}
+        state: mounted
+      loop:
+        - { src: "{{ data_mount }}/mysql", dst: /var/lib/mysql }
+        - { src: "{{ data_mount }}/www", dst: /var/www }
+
+    # ---------- Paquetes ----------
+    - name: Instalar paquetes
+      ansible.builtin.apt:
+        update_cache: true
+        name:
+          - nginx
+          - mariadb-server
+          - python3-pymysql
+          - "php{{ php_ver }}-fpm"
+          - "php{{ php_ver }}-mysql"
+          - "php{{ php_ver }}-curl"
+          - "php{{ php_ver }}-gd"
+          - "php{{ php_ver }}-intl"
+          - "php{{ php_ver }}-mbstring"
+          - "php{{ php_ver }}-xml"
+          - "php{{ php_ver }}-zip"
+          - "php{{ php_ver }}-imagick"
+          - unzip
+          - curl
+          - certbot
+
+    - name: MariaDB arrancado
+      ansible.builtin.service:
+        name: mariadb
+        state: started
+        enabled: true
+
+    # ---------- Base de datos ----------
+    - name: Crear BD
+      community.mysql.mysql_db:
+        name: "{{ wp_db }}"
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    - name: Crear usuario BD
+      community.mysql.mysql_user:
+        name: "{{ wp_db_user }}"
+        password: "{{ wp_db_pass }}"
+        priv: "{{ wp_db }}.*:ALL"
+        host: localhost
+        login_unix_socket: /run/mysqld/mysqld.sock
+
+    # ---------- WordPress ----------
+    - name: Descargar WordPress
+      ansible.builtin.unarchive:
+        src: https://wordpress.org/latest.tar.gz
+        dest: /var/www
+        remote_src: true
+        owner: www-data
+        group: www-data
+        creates: "{{ wp_root }}/wp-settings.php"
+
+    - name: Obtener salts
+      ansible.builtin.uri:
+        url: https://api.wordpress.org/secret-key/1.1/salt/
+        return_content: true
+      register: wp_salts
+      changed_when: false
+
+    - name: wp-config.php
+      ansible.builtin.template:
+        src: templates/wp-config.php.j2
+        dest: "{{ wp_root }}/wp-config.php"
+        owner: www-data
+        group: www-data
+        mode: "0640"
+        force: false   # no regenerar salts en re-ejecuciones
+
+    - name: PHP límites de subida
+      ansible.builtin.copy:
+        dest: "/etc/php/{{ php_ver }}/fpm/conf.d/99-wordpress.ini"
+        content: |
+          upload_max_filesize = 64M
+          post_max_size = 64M
+          memory_limit = 256M
+      notify: restart php-fpm
+
+    # ---------- nginx ----------
+    - name: Webroot ACME
+      ansible.builtin.file:
+        path: "{{ acme_webroot }}"
+        state: directory
+
+    - name: Quitar default
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Habilitar vhost
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/wordpress
+        dest: /etc/nginx/sites-enabled/wordpress
+        state: link
+        force: true
+      notify: reload nginx
+
+    - name: ¿Existe ya el certificado?
+      ansible.builtin.stat:
+        path: "{{ cert_dir }}/fullchain.pem"
+      register: cert
+
+    - name: vhost nginx
+      ansible.builtin.template:
+        src: templates/nginx-wordpress.conf.j2
+        dest: /etc/nginx/sites-available/wordpress
+      vars:
+        wp_tls: "{{ cert.stat.exists }}"
+      notify: reload nginx
+
+    - name: Aplicar nginx antes de pedir el certificado
+      ansible.builtin.meta: flush_handlers
+
+    # ---------- Let's Encrypt ----------
+    - name: Obtener certificado Let's Encrypt (webroot)
+      ansible.builtin.command: >
+        certbot certonly --webroot -w {{ acme_webroot }}
+        -d {{ wp_domain }} --non-interactive --agree-tos
+        {{ ('-m ' ~ letsencrypt_email) if letsencrypt_email else '--register-unsafely-without-email' }}
+        --deploy-hook "systemctl reload nginx"
+      args:
+        creates: "{{ cert_dir }}/fullchain.pem"
+      register: certbot
+
+    - name: vhost nginx con TLS
+      ansible.builtin.template:
+        src: templates/nginx-wordpress.conf.j2
+        dest: /etc/nginx/sites-available/wordpress
+      vars:
+        wp_tls: true
+      notify: reload nginx
+
+    - name: Renovación automática activa
+      ansible.builtin.service:
+        name: certbot.timer
+        state: started
+        enabled: true
+
+  handlers:
+    - name: restart php-fpm
+      ansible.builtin.service:
+        name: "php{{ php_ver }}-fpm"
+        state: restarted
+    - name: reload nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded

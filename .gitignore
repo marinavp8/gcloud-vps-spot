@@ -1,0 +1,19 @@
+# Claves SSH generadas por Terraform
+keys/
+
+# Terraform: estado (contiene la clave privada) y caché de providers
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/crash.log
+*.tfvars
+*.tfplan
+
+# Ansible: inventario generado y secretos
+ansible/inventory.ini
+ansible/.wp-secrets/
+*.retry
+
+# Varios
+*.bak
+.DS_Store

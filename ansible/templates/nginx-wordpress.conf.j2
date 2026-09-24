@@ -1,0 +1,51 @@
+{% set wp_tls = wp_tls | bool %}
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name {{ wp_domain }};
+
+    # Desafío HTTP-01 de Let's Encrypt
+    location ^~ /.well-known/acme-challenge/ {
+        root {{ acme_webroot }};
+        default_type text/plain;
+    }
+
+{% if wp_tls %}
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    server_name {{ wp_domain }};
+
+    ssl_certificate     {{ cert_dir }}/fullchain.pem;
+    ssl_certificate_key {{ cert_dir }}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:SSL:10m;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+{% endif %}
+
+    root {{ wp_root }};
+    index index.php index.html;
+    client_max_body_size 64M;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php{{ php_ver }}-fpm.sock;
+    }
+
+    location ~ /\.(ht|git) { deny all; }
+    location = /xmlrpc.php { deny all; }
+
+    location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|webp|woff2?)$ {
+        expires 30d;
+        access_log off;
+    }
+}
